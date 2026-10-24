@@ -1,0 +1,44 @@
+{
+  "data": {
+    "name": "cifar100",
+    "root": "data",
+    "pretrain_per_class": 350,
+    "calibration_per_class": 50,
+    "adaptation_per_class": 75,
+    "validation_per_class": 25,
+    "workers": 4,
+    "contexts": [
+      {"kind": "clean", "severity": 0.0},
+      {"kind": "gaussian_noise", "severity": 0.15}
+    ],
+    "test_views": [
+      {"kind": "clean", "severity": 0.0},
+      {"kind": "gaussian_noise", "severity": 0.15},
+      {"kind": "gaussian_noise", "severity": 0.25},
+      {"kind": "contrast", "severity": 0.3}
+    ]
+  },
+  "model": {"architecture": "resnet18", "small_stem": true, "adapter_hidden": 128},
+  "pretrain": {
+    "epochs": 200, "batch_size": 128, "learning_rate": 0.1,
+    "momentum": 0.9, "weight_decay": 0.0005, "warmup_epochs": 5
+  },
+  "calibration": {"steps": 150, "learning_rate": 0.03},
+  "bandit": {
+    "batch_size": 64, "learning_rate": 0.0001,
+    "kl_coefficient": 0.1, "entropy_coefficient": 0.001,
+    "checkpoint_every": 25, "log_every": 10,
+    "phases": [
+      {"name": "stable_reliable", "updates": 125, "volatility": 0.002, "feedback_flip": 0.05},
+      {"name": "stable_noisy", "updates": 125, "volatility": 0.002, "feedback_flip": 0.30},
+      {"name": "volatile_reliable", "updates": 125, "volatility": 0.02, "feedback_flip": 0.05},
+      {"name": "volatile_noisy", "updates": 125, "volatility": 0.02, "feedback_flip": 0.30}
+    ]
+  },
+  "filter": {
+    "particles": 512, "volatility_initial": 0.01, "noise_initial": 0.1,
+    "volatility_diffusion": 0.001, "noise_diffusion": 0.001,
+    "resample_fraction": 0.5
+  },
+  "evaluation": {"batch_size": 256, "ece_bins": 15}
+}
