@@ -19,6 +19,7 @@ from .config import View, digest
 from .data import load_training_data
 from .evaluate import evaluate, print_comparison
 from .pretrain import pretrain
+from .progress import format_duration
 from .train import train_arm
 
 
@@ -70,23 +71,40 @@ def run(config, root, seed=0, device_name="cuda", methods=("baseline", "pfhmm"),
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
         started = time.monotonic()
+        print(f"Experiment seed={seed} methods={methods} -> {root}", flush=True)
+        print("Stage 1/5: source pretraining", flush=True)
+        source_reference = root / "shared" / "source_checkpoint.json"
+        if source_reference.exists():
+            reference = json.loads(source_reference.read_text())
+            established_path = Path(reference["path"])
+            if not established_path.is_absolute():
+                established_path = root / established_path
+            if reference["experiment_identity"] != identity or file_hash(established_path) != reference["sha256"]:
+                raise ValueError("The established source checkpoint has incompatible provenance or checksum")
+            base_checkpoint = established_path
         backbone, source_state, source_path = pretrain(
             config, dataset, splits, split_manifest, root, seed, device, source_hash, base_checkpoint)
+        source_checksum = file_hash(source_path)
+        source_path = Path(source_path).resolve()
+        stored_source_path = str(source_path.relative_to(root)) if source_path.is_relative_to(root) else str(source_path)
+        atomic_json(source_reference, {"experiment_identity": identity, "path": stored_source_path,
+                                       "sha256": source_checksum})
         source_peak_memory = torch.cuda.max_memory_allocated(device) if device.type == "cuda" else 0
         if stage == "pretrain":
             return None
         for parameter in backbone.parameters():
             parameter.requires_grad_(False)
-        source_checksum = file_hash(source_path)
         shared_identity = digest({"source_checkpoint": source_checksum, "code": source_hash})
         normalization = source_state["normalization"]
         caches = {}
+        print(f"Stage 2/5: frozen feature caches; elapsed={format_duration(time.monotonic() - started)}", flush=True)
         for name in ("calibration", "adaptation", "validation"):
             views = config.data.contexts if name != "validation" else (View(),)
             caches[name] = feature_cache(
                 backbone, dataset, splits[name], views, normalization, config,
                 root / "shared" / f"{name}_features.pt", shared_identity, device, seed + 4001)
         calibration_path = root / "shared" / "calibration.json"
+        print(f"Stage 3/5: calibration; elapsed={format_duration(time.monotonic() - started)}", flush=True)
         calibration_identity = digest({"cache": caches["calibration"]["fingerprint"],
                                        "config": asdict(config.calibration)})
         if calibration_path.exists():
@@ -124,6 +142,7 @@ def run(config, root, seed=0, device_name="cuda", methods=("baseline", "pfhmm"),
             "mean_action_weighted_probability_gap_by_actual_context": separations,
             "interpretation": "A zero gap makes latent visual context unidentifiable from this likelihood; a positive gap does not establish identifiability."})
         for name in methods:
+            print(f"Stage 4/5: {name} training; elapsed={format_duration(time.monotonic() - started)}", flush=True)
             models[name], summaries[name] = train_arm(
                 name, config, caches["adaptation"], np.asarray(dataset.targets)[splits["adaptation"]],
                 caches["validation"], torch.tensor(np.asarray(dataset.targets)[splits["validation"]]),
@@ -137,6 +156,7 @@ def run(config, root, seed=0, device_name="cuda", methods=("baseline", "pfhmm"),
             "completed_methods": {name: summary["checkpoint_sha256"] for name, summary in summaries.items()},
             "selection": "fixed final update", "seed": seed})
         test = CIFAR100(root=config.data.root, train=False, download=config.data.download)
+        print(f"Stage 5/5: final test cache and evaluation; elapsed={format_duration(time.monotonic() - started)}", flush=True)
         test_cache = feature_cache(
             backbone, test, np.arange(len(test)), config.data.test_views, normalization, config,
             root / "shared" / "test_features.pt", shared_identity, device, seed + 9001)
@@ -145,6 +165,7 @@ def run(config, root, seed=0, device_name="cuda", methods=("baseline", "pfhmm"),
         peak_memory = torch.cuda.max_memory_allocated(device) if device.type == "cuda" else 0
         atomic_json(root / "complete.json", {
             "identity": identity, "seed": seed, "methods": list(methods),
+            "shared_base_checkpoint": str(Path(source_path).resolve()),
             "shared_base_sha256": source_checksum, "results_sha256": file_hash(root / "results.json"),
             "runtime": runtime_metadata(device), "this_invocation_seconds": time.monotonic() - started,
             "this_invocation_peak_cuda_bytes": max(source_peak_memory, peak_memory,
@@ -152,4 +173,5 @@ def run(config, root, seed=0, device_name="cuda", methods=("baseline", "pfhmm"),
             "total_feedback_per_method": config.bandit.updates * config.bandit.batch_size,
             "supervised_pretraining_epochs": config.pretrain.epochs,
             "calibration_labeled_examples": config.data.calibration_per_class * len(dataset.classes)})
+        print(f"Experiment seed={seed} complete; elapsed={format_duration(time.monotonic() - started)}", flush=True)
         return result

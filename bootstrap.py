@@ -1,6 +1,7 @@
 """Install pinned CPU/CUDA wheels into a dedicated Conda environment using Python only."""
 
 import argparse
+from contextlib import contextmanager
 import importlib.metadata
 import json
 import os
@@ -9,6 +10,51 @@ import platform
 import shutil
 import subprocess
 import sys
+import threading
+import time
+
+
+def _elapsed(seconds):
+    """Format monotonic elapsed time without presenting an unmeasured completion estimate."""
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+@contextmanager
+def _setup_stage(label, index, total, setup_started):
+    """Report setup-stage completion and live elapsed time while subprocess output stays visible."""
+    started = time.monotonic()
+    finished = threading.Event()
+
+    def report():
+        """Identify the running stage and elapsed time without predicting network or solver speed."""
+        print(f"setup stage={index}/{total} {label} completed={index - 1}/{total} "
+              f"({100 * (index - 1) / total:.1f}%) "
+              f"elapsed={_elapsed(time.monotonic() - setup_started)} eta=unknown", flush=True)
+
+    def heartbeat():
+        """Keep elapsed-time feedback visible during long solver and download operations."""
+        while not finished.wait(30.0):
+            report()
+
+    report()
+    worker = threading.Thread(target=heartbeat, daemon=True)
+    worker.start()
+    try:
+        yield
+    except BaseException:
+        print(f"setup stage={index}/{total} failed: {label} "
+              f"elapsed={_elapsed(time.monotonic() - setup_started)}", flush=True)
+        raise
+    else:
+        print(f"setup completed={index}/{total} ({100 * index / total:.1f}%) {label} "
+              f"stage_elapsed={_elapsed(time.monotonic() - started)} "
+              f"elapsed={_elapsed(time.monotonic() - setup_started)}", flush=True)
+    finally:
+        finished.set()
+        worker.join()
 
 
 def pins(root):
@@ -76,6 +122,7 @@ def environment_probe(expected, device):
 
 def setup(root, device, prefix=None, conda=None, verify_only=False):
     """Create one isolated Conda environment without touching base or an existing unrelated folder."""
+    setup_started = time.monotonic()
     root = Path(root).resolve()
     prefix = Path(prefix or root / ".conda").resolve()
     conda = conda or os.environ.get("CONDA_EXE") or shutil.which("conda")
@@ -91,31 +138,46 @@ def setup(root, device, prefix=None, conda=None, verify_only=False):
     environment = {**os.environ, "PYTHONNOUSERSITE": "1",
                    "PIP_CACHE_DIR": str(root / ".cache" / "pip"),
                    "CONDA_PKGS_DIRS": str(root / ".cache" / "conda_pkgs")}
-    if not marker.is_file():
-        if verify_only:
-            raise RuntimeError("The Conda environment does not exist yet")
-        subprocess.run([conda, "create", "--yes", "--prefix", str(prefix), "--override-channels",
-                        "--channel", "conda-forge", "python=3.11", "pip"], check=True, env=environment)
+    if verify_only and not marker.is_file():
+        raise RuntimeError("The Conda environment does not exist yet")
+    print(f"Environment setup: device={device} prefix={prefix}; "
+          "download/solver ETA is unknown; elapsed time refreshes every 30 seconds.", flush=True)
+    with _setup_stage("Conda environment", 1, 5, setup_started):
+        if not marker.is_file():
+            subprocess.run([conda, "create", "--yes", "--prefix", str(prefix), "--override-channels",
+                            "--channel", "conda-forge", "python=3.11", "pip"], check=True, env=environment)
+        else:
+            print(f"Reusing Conda environment: {prefix}", flush=True)
     executable = prefix / "bin" / "python"
     expected = pins(root)
-    if not verify_only:
-        index = f"https://download.pytorch.org/whl/{'cu128' if device == 'cuda' else 'cpu'}"
-        subprocess.run([str(executable), "-m", "pip", "install", "--index-url", index,
-                        *wheels],
-                       check=True, env=environment)
-        subprocess.run([str(executable), "-m", "pip", "install", "-r", str(root / "requirements.txt")],
-                       check=True, env=environment)
-    command = [str(executable), str(root / "bootstrap.py"), "--internal-probe", device]
-    result = subprocess.run(command, check=True, env=environment, text=True, capture_output=True)
-    report = json.loads(result.stdout)
-    if Path(report["prefix"]).resolve() != prefix:
-        raise RuntimeError("The installed interpreter did not use the requested prefix")
-    destination = root / "verification"
-    destination.mkdir(exist_ok=True)
-    (destination / f"environment_{device}.json").write_text(json.dumps(report, indent=2) + "\n")
-    frozen = subprocess.check_output([str(executable), "-m", "pip", "freeze"], env=environment, text=True)
-    (destination / f"requirements_{device}_observed.txt").write_text(frozen)
+    with _setup_stage("PyTorch and torchvision wheels", 2, 5, setup_started):
+        if not verify_only:
+            index = f"https://download.pytorch.org/whl/{'cu128' if device == 'cuda' else 'cpu'}"
+            subprocess.run([str(executable), "-m", "pip", "install", "--index-url", index,
+                            *wheels], check=True, env=environment)
+        else:
+            print("Verification only: skipping wheel installation", flush=True)
+    with _setup_stage("Pinned dependencies", 3, 5, setup_started):
+        if not verify_only:
+            subprocess.run([str(executable), "-m", "pip", "install", "-r", str(root / "requirements.txt")],
+                           check=True, env=environment)
+        else:
+            print("Verification only: skipping dependency installation", flush=True)
+    with _setup_stage("Device and convolution-gradient verification", 4, 5, setup_started):
+        command = [str(executable), str(root / "bootstrap.py"), "--internal-probe", device]
+        result = subprocess.run(command, check=True, env=environment, text=True, capture_output=True)
+        report = json.loads(result.stdout)
+        if Path(report["prefix"]).resolve() != prefix:
+            raise RuntimeError("The installed interpreter did not use the requested prefix")
+    with _setup_stage("Save environment verification", 5, 5, setup_started):
+        destination = root / "verification"
+        destination.mkdir(exist_ok=True)
+        (destination / f"environment_{device}.json").write_text(json.dumps(report, indent=2) + "\n")
+        frozen = subprocess.check_output([str(executable), "-m", "pip", "freeze"], env=environment, text=True)
+        (destination / f"requirements_{device}_observed.txt").write_text(frozen)
     print(json.dumps(report, indent=2), flush=True)
+    print(f"Environment setup complete: elapsed={_elapsed(time.monotonic() - setup_started)} "
+          f"python={executable}", flush=True)
     return executable
 
 

@@ -10,6 +10,7 @@ from .artifacts import atomic_json, atomic_torch, file_hash, load_checkpoint
 from .config import digest
 from .data import ContextDataset, view_fingerprint
 from .models import encode
+from .progress import Progress
 
 
 def feature_cache(model, dataset, indices, views, normalization, config, path, identity, device, seed):
@@ -28,11 +29,14 @@ def feature_cache(model, dataset, indices, views, normalization, config, path, i
         cached = load_checkpoint(path)
         if cached.get("fingerprint") != expected:
             raise ValueError("Feature-cache contents have a different identity")
+        print(f"Reusing completed feature cache: {path}", flush=True)
         return cached
     if path.exists() != sidecar.exists():
         print(f"Rebuilding an interrupted feature-cache commit: {path}", flush=True)
     model.eval()
     features, logits = [], []
+    progress = Progress(len(views) * len(indices), f"cache {path.name} examples")
+    progress.report(force=True)
     for context, view in enumerate(views):
         source = ContextDataset(dataset, indices, view, *normalization, view_seed=seed)
         loader = DataLoader(source, batch_size=config.evaluation.batch_size, shuffle=False,
@@ -45,9 +49,11 @@ def feature_cache(model, dataset, indices, views, normalization, config, path, i
                 hidden, predictions = encode(model, images.to(device))
                 context_features.append(hidden.cpu().float())
                 context_logits.append(predictions.cpu().float())
+                progress.report(progress.completed + len(images),
+                                detail=f"context={context + 1}/{len(views)}")
         features.append(torch.cat(context_features))
         logits.append(torch.cat(context_logits))
-        print(f"cache={path.name} context={context} examples={len(source)}", flush=True)
+        progress.report(force=True, detail=f"context={context + 1}/{len(views)} complete")
     cached = {"fingerprint": expected, "features": torch.stack(features),
               "logits": torch.stack(logits), "indices": np.asarray(indices, dtype=np.int64)}
     atomic_torch(path, cached)

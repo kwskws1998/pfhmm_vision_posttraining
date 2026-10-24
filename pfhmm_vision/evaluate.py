@@ -10,6 +10,7 @@ import torch
 from .artifacts import atomic_json, atomic_npz, _atomic_write
 from .data import view_key
 from .metrics import classification_metrics, predict_adapter
+from .progress import Progress
 
 
 def evaluate(models, test_cache, targets, views, config, root, device, training_summaries):
@@ -18,18 +19,24 @@ def evaluate(models, test_cache, targets, views, config, root, device, training_
         raise RuntimeError("Final-test evaluation requires completed training for every requested arm")
     target = torch.as_tensor(targets)
     rows, predictions = [], {}
+    progress = Progress(len(views) * (len(models) + 1), "evaluation policies/conditions")
+    progress.report(force=True)
     for index, view in enumerate(views):
         feature, reference = test_cache["features"][index], test_cache["logits"][index]
         baseline_metrics = classification_metrics(reference, target, config.evaluation.ece_bins)
         rows.append({"method": "frozen_base", "condition": view_key(view), **baseline_metrics,
                      "accuracy_gain_pp": 0.0})
         predictions[f"base_{index}"] = reference.numpy()
+        progress.report(progress.completed + 1,
+                        detail=f"condition={view_key(view)} method=frozen_base")
         for name, model in models.items():
             logits = predict_adapter(model, feature, reference, config.evaluation.batch_size, device)
             metrics = classification_metrics(logits, target, config.evaluation.ece_bins)
             rows.append({"method": name, "condition": view_key(view), **metrics,
                          "accuracy_gain_pp": 100 * (metrics["accuracy"] - baseline_metrics["accuracy"])})
             predictions[f"{name}_{index}"] = logits.numpy()
+            progress.report(progress.completed + 1,
+                            detail=f"condition={view_key(view)} method={name}", force=True)
     comparisons = []
     for view in views:
         condition = view_key(view)

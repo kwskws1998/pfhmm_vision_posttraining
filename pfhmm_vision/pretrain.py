@@ -3,7 +3,6 @@
 from dataclasses import asdict
 import math
 from pathlib import Path
-import time
 
 import numpy as np
 import torch
@@ -14,6 +13,7 @@ from .artifacts import atomic_torch, load_checkpoint, restore_rng, rng_state, se
 from .config import digest
 from .data import PretrainingDataset, normalization
 from .models import make_backbone
+from .progress import Progress
 
 
 def pretraining_identity(config, manifest, seed, source_hash):
@@ -30,15 +30,17 @@ def _epoch_learning_rate(config, epoch):
     return config.learning_rate * 0.5 * (1 + math.cos(math.pi * progress))
 
 
-def _source_accuracy(model, loader, device):
+def _source_accuracy(model, loader, device, progress=None, completed=0):
     """Measure source-validation accuracy without modifying frozen evaluation statistics."""
     model.eval()
     correct, total = 0, 0
     with torch.inference_mode():
-        for images, targets in loader:
+        for batch, (images, targets) in enumerate(loader, 1):
             predictions = model(images.to(device)).argmax(1).cpu()
             correct += int((predictions == targets).sum())
             total += len(targets)
+            if progress is not None:
+                progress.report(completed + batch, detail="source validation")
     return correct / total
 
 
@@ -79,8 +81,12 @@ def pretrain(config, dataset, splits, manifest, root, seed, device, source_hash,
                                    shuffle=False, num_workers=config.data.workers,
                                    generator=torch.Generator().manual_seed(seed + 19))
     criterion = nn.CrossEntropyLoss()
+    training_batches = math.ceil(len(source) / config.pretrain.batch_size)
+    epoch_batches = training_batches + len(validation_loader)
+    progress = Progress(config.pretrain.epochs * epoch_batches, "pretrain batches",
+                        completed=start * epoch_batches, elapsed_seconds=elapsed)
+    progress.report(force=True, detail=f"epoch={start}/{config.pretrain.epochs}")
     for epoch in range(start, config.pretrain.epochs):
-        started = time.monotonic()
         learning_rate = _epoch_learning_rate(config.pretrain, epoch)
         for group in optimizer.param_groups:
             group["lr"] = learning_rate
@@ -89,7 +95,7 @@ def pretrain(config, dataset, splits, manifest, root, seed, device, source_hash,
                             generator=torch.Generator().manual_seed(seed + epoch), drop_last=False)
         model.train()
         loss_sum, correct, count = 0.0, 0, 0
-        for images, targets in loader:
+        for batch, (images, targets) in enumerate(loader, 1):
             images, targets = images.to(device), targets.to(device)
             optimizer.zero_grad(set_to_none=True)
             logits = model(images)
@@ -103,8 +109,12 @@ def pretrain(config, dataset, splits, manifest, root, seed, device, source_hash,
             loss_sum += float(loss.detach()) * len(targets)
             correct += int((logits.argmax(1) == targets).sum())
             count += len(targets)
-        accuracy = _source_accuracy(model, validation_loader, device)
-        elapsed += time.monotonic() - started
+            progress.report(epoch * epoch_batches + batch,
+                            detail=f"epoch={epoch + 1}/{config.pretrain.epochs} "
+                                   f"batch={batch}/{training_batches}")
+        accuracy = _source_accuracy(model, validation_loader, device, progress,
+                                    epoch * epoch_batches + training_batches)
+        elapsed = progress.snapshot()["elapsed_seconds"]
         record = {"epoch": epoch + 1, "loss": loss_sum / count,
                   "training_accuracy": correct / count, "validation_accuracy": accuracy,
                   "learning_rate": learning_rate}
@@ -114,6 +124,6 @@ def pretrain(config, dataset, splits, manifest, root, seed, device, source_hash,
                  "normalization": [mean, std], "history": history, "elapsed_seconds": elapsed,
                  "classes": dataset.classes, "source_split": manifest["fingerprint"]}
         atomic_torch(destination, state)
-        print(f"pretrain epoch={epoch + 1}/{config.pretrain.epochs} "
-              f"loss={record['loss']:.4f} validation_accuracy={accuracy:.4f}", flush=True)
+        progress.report(force=True, detail=f"epoch={epoch + 1}/{config.pretrain.epochs} "
+                        f"loss={record['loss']:.4f} validation_accuracy={accuracy:.4f}")
     return model.eval(), state, destination

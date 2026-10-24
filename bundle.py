@@ -13,6 +13,7 @@ def main():
     files += [root / "requirements.txt", root / "environment.yml", root / ".gitignore"]
     for directory, pattern in (("pfhmm_vision", "*.py"), ("tests", "*.py"), ("configs", "*.json")):
         files.extend((root / directory).glob(pattern))
+    files.extend((root / "configs").glob("*.py"))
     with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for path in sorted(set(files)):
             archive.write(path, arcname=str(Path(root.name) / path.relative_to(root)))

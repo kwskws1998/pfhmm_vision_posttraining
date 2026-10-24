@@ -13,6 +13,7 @@ from .environment import FeedbackOracle
 from .methods import make_method
 from .metrics import audit_metrics, classification_metrics, predict_adapter
 from .models import make_adapter
+from .progress import Progress
 
 
 def sample_actions(logits, uniforms):
@@ -77,6 +78,9 @@ def train_arm(name, config, adaptation_cache, adaptation_labels, validation_cach
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
     call_started = time.monotonic()
+    progress = Progress(config.bandit.updates, f"{name} updates", completed=start,
+                        elapsed_seconds=elapsed)
+    progress.report(force=True, detail=f"feedback={start * config.bandit.batch_size}")
     committed_elapsed = elapsed
     for step in range(start, config.bandit.updates):
         if stop_after is not None and step >= stop_after:
@@ -120,10 +124,11 @@ def train_arm(name, config, adaptation_cache, adaptation_labels, validation_cach
             record["clean_validation"] = classification_metrics(
                 prediction, validation_labels, config.evaluation.ece_bins)
         history.append(record)
-        if (step + 1) % config.bandit.log_every == 0 or step == start:
-            print(f"{name} step={step + 1}/{config.bandit.updates} "
-                  f"feedback={record['feedback_count']} observed_reward={record['observed_reward']:.4f} "
-                  f"kl={record['kl']:.5f}", flush=True)
+        progress.report(step + 1,
+                        detail=f"feedback={record['feedback_count']} "
+                               f"observed_reward={record['observed_reward']:.4f} "
+                               f"kl={record['kl']:.5f}",
+                        force=(step + 1) % config.bandit.log_every == 0 or step == start)
         needs_save = ((step + 1) % config.bandit.checkpoint_every == 0 or
                       step + 1 == config.bandit.updates or
                       (stop_after is not None and step + 1 >= stop_after))

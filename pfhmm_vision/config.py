@@ -244,4 +244,11 @@ def as_field_values(value):
 def load_config(path=None):
     """Load a partial JSON configuration and expand all documented defaults."""
     values = {} if path is None else json.loads(Path(path).read_text())
-    return _merge(Config(), values).validate()
+    return configure(**values)
+
+
+def configure(base=None, **overrides):
+    """Apply strict nested Python dictionaries to an immutable base configuration."""
+    if base is not None and not isinstance(base, Config):
+        raise TypeError("base must be a Config instance")
+    return _merge(Config() if base is None else base, overrides).validate()
